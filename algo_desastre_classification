@@ -1,0 +1,926 @@
+# -*- coding: utf-8 -*-
+"""
+algo_desastre_classification
+============================
+
+Génération procédurale d'images satellites "avec désastre" à partir des images
+saines du dataset DeepGlobe Land Cover Classification
+(https://www.kaggle.com/datasets/balraj98/deepglobe-land-cover-classification-dataset).
+
+Structure attendue du dataset :
+    dataset/train/<id>_sat.jpg   image satellite RGB (2448x2448, 50 cm/pixel)
+    dataset/train/<id>_mask.png  masque d'occupation du sol (couleurs RGB)
+    dataset/valid/<id>_sat.jpg   (pas de masque -> estimation heuristique)
+
+Principe (algorithmes classiques, sans réseau de neurones)
+----------------------------------------------------------
+1. Analyse de la scène : l'image est découpée en superpixels (SLIC) de la
+   taille d'une maison. Chaque superpixel est classé en végétation / toit /
+   sol-route / eau, grâce à un indice de verdure (ExG + seuil d'Otsu), au
+   contraste local de luminance et au masque DeepGlobe.
+2. Zone touchée : un champ continu (distance à l'eau, au foyer ou à
+   l'épicentre + bruit fractal) est seuillé, puis "accroché" aux superpixels
+   pour que les dégâts suivent les objets réels de l'image.
+3. Rendu objet par objet, inspiré d'images post-catastrophe réelles (xBD) :
+    - flood      : eau boueuse dans les rues et jardins, les toits émergent,
+                   la canopée des arbres reste partiellement visible, sol
+                   mouillé en bordure, rivière en crue.
+    - fire       : maisons réduites à des empreintes de cendres grises avec
+                   contours carbonisés, arbres noircis/roussis, sol brûlé,
+                   quelques maisons épargnées ; front de flammes et fumée
+                   optionnels (feu "actif").
+    - earthquake : effondrement d'une partie des bâtiments (plus probable près
+                   de l'épicentre) : gravats brouillés qui débordent sur la
+                   rue, toits partiellement endommagés, poussière légère.
+    - tornado    : couloir étroit et long qui traverse l'image (largeur et
+                   intensité variables, interruptions quand la tornade se
+                   soulève) : maisons arrachées jusqu'à la dalle, toits
+                   arrachés, bâches bleues, arbres cassés couchés en motif
+                   convergent, sol décapé, débris dispersés par le vent.
+4. Réalisme photométrique : la texture d'origine est conservée par
+   modulation de luminance, les couches synthétiques sont légèrement floutées
+   et reçoivent le même niveau de bruit capteur que l'image.
+
+Pour chaque image générée on produit un masque binaire des dégâts et un label.
+
+Usage :
+    python algo_desastre_classification --image dataset/train/707319_sat.jpg --type all --size 1024 --out sortie
+    python algo_desastre_classification --dataset dataset/train --n 200 --size 1024 --out dataset_desastre
+
+Dépendances : numpy, opencv-python, scikit-image
+"""
+
+import argparse
+import csv
+import os
+import sys
+from glob import glob
+
+import cv2
+import numpy as np
+from skimage.filters import threshold_otsu
+from skimage.segmentation import slic
+
+# ---------------------------------------------------------------------------
+# Classes DeepGlobe
+# ---------------------------------------------------------------------------
+URBAN, AGRICULTURE, RANGELAND, FOREST, WATER, BARREN, UNKNOWN = range(7)
+
+CLASSES = {
+    URBAN: ("urban_land", (0, 255, 255)),
+    AGRICULTURE: ("agriculture_land", (255, 255, 0)),
+    RANGELAND: ("rangeland", (255, 0, 255)),
+    FOREST: ("forest_land", (0, 255, 0)),
+    WATER: ("water", (0, 0, 255)),
+    BARREN: ("barren_land", (255, 255, 255)),
+    UNKNOWN: ("unknown", (0, 0, 0)),
+}
+
+DISASTERS = ("flood", "fire", "earthquake", "tornado")
+NATIVE_SIZE = 2448      # taille native des tuiles DeepGlobe
+NATIVE_GSD = 0.5        # mètres par pixel à la taille native
+
+
+# ---------------------------------------------------------------------------
+# Entrées / sorties
+# ---------------------------------------------------------------------------
+def read_rgb(path):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(path)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def write_rgb(path, img):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+
+def decode_mask(mask_rgb):
+    """Masque couleur DeepGlobe -> carte d'indices de classes (H, W)."""
+    m = (mask_rgb >= 128).astype(np.uint8)
+    code = m[..., 0] * 4 + m[..., 1] * 2 + m[..., 2]
+    lut = np.full(8, UNKNOWN, np.uint8)
+    for idx, (_, (r, g, b)) in CLASSES.items():
+        lut[(r // 255) * 4 + (g // 255) * 2 + (b // 255)] = idx
+    return lut[code]
+
+
+def estimate_classes(img):
+    """Estimation grossière des classes par couleur (images sans masque)."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+    h, s, v = hsv[..., 0] * 2, hsv[..., 1] / 255, hsv[..., 2] / 255
+    r, b = img[..., 0].astype(np.float32), img[..., 2].astype(np.float32)
+    cls = np.full(img.shape[:2], AGRICULTURE, np.uint8)
+    cls[(s < 0.18) & (v > 0.35)] = URBAN
+    cls[(h > 60) & (h < 170) & (v < 0.45) & (s > 0.15)] = FOREST
+    cls[(h >= 170) & (h < 260) & (b > r) & (v < 0.55)] = WATER
+    cls[(v > 0.75) & (s < 0.12)] = BARREN
+    k = max(3, (min(img.shape[:2]) // 150) | 1)
+    return cv2.medianBlur(cls, k)
+
+
+def load_pair(sat_path, mask_path=None, size=None):
+    img = read_rgb(sat_path)
+    if mask_path is None:
+        guess = sat_path.replace("_sat.jpg", "_mask.png")
+        mask_path = guess if guess != sat_path and os.path.exists(guess) else None
+    cls = decode_mask(read_rgb(mask_path)) if mask_path else None
+    if size:
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+        if cls is not None:
+            cls = cv2.resize(cls, (size, size), interpolation=cv2.INTER_NEAREST)
+    has_mask = cls is not None
+    if not has_mask:
+        cls = estimate_classes(img)
+    return img, cls, has_mask
+
+
+# ---------------------------------------------------------------------------
+# Outils
+# ---------------------------------------------------------------------------
+def normalize(a):
+    a = a.astype(np.float32)
+    lo, hi = float(a.min()), float(a.max())
+    return (a - lo) / (hi - lo + 1e-8)
+
+
+def noise_px(shape, rng, size_px, octaves=3, persistence=0.5):
+    """Bruit fractal dont les plus gros motifs font ~size_px pixels, dans [0,1]."""
+    h, w = shape
+    out = np.zeros((h, w), np.float32)
+    amp, total, k = 1.0, 0.0, max(1.5, float(size_px))
+    for _ in range(octaves):
+        gh, gw = int(h / k) + 2, int(w / k) + 2
+        grid = rng.random((gh, gw)).astype(np.float32)
+        out += amp * cv2.resize(grid, (w, h), interpolation=cv2.INTER_CUBIC)
+        total += amp
+        amp *= persistence
+        k = max(1.5, k / 2)
+    return normalize(out / total)
+
+
+def soft(mask, sigma):
+    if sigma <= 0.3:
+        return mask.astype(np.float32)
+    return np.clip(cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigma), 0, 1)
+
+
+def blend(img, color, alpha):
+    a = alpha[..., None] if alpha.ndim == 2 else alpha
+    return img * (1 - a) + color * a
+
+
+def luminance(img):
+    return img[..., 0] * 0.299 + img[..., 1] * 0.587 + img[..., 2] * 0.114
+
+
+def smoothstep(x):
+    x = np.clip(x, 0, 1)
+    return x * x * (3 - 2 * x)
+
+
+def disk(r):
+    r = max(1, int(round(r)))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+
+def clean_mask(mask, r_px, min_area_px):
+    m = mask.astype(np.uint8)
+    k = disk(r_px)
+    m = cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    keep = np.zeros(n, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_area_px
+    return keep[lab]
+
+
+def quantile_mask(score, region, frac):
+    if not region.any():
+        return np.zeros_like(region), 0.0
+    level = np.quantile(score[region], float(np.clip(frac, 0.01, 0.99)))
+    return (score <= level) & region, level
+
+
+def random_point(mask, rng):
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        h, w = mask.shape
+        return int(rng.integers(h)), int(rng.integers(w))
+    i = rng.integers(len(ys))
+    return int(ys[i]), int(xs[i])
+
+
+def shift(a, dx, dy):
+    h, w = a.shape[:2]
+    m = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(a, m, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+# ---------------------------------------------------------------------------
+# Analyse de la scène
+# ---------------------------------------------------------------------------
+class Scene:
+    """Image + segmentation en objets (superpixels) + cartes sémantiques."""
+
+    def __init__(self, img, cls, has_mask=True):
+        self.has_mask = has_mask   # vrai masque DeepGlobe (sinon estimation)
+        self.img = img
+        self.cls = cls
+        self.f = img.astype(np.float32)
+        self.h, self.w = cls.shape
+        # pixels par mètre (on suppose que la tuile couvre toujours la même zone)
+        self.ppm = (self.w / NATIVE_SIZE) / NATIVE_GSD
+        self.lum = luminance(self.f)
+        yy, xx = np.mgrid[0:self.h, 0:self.w]
+        self.yy, self.xx = yy.astype(np.float32), xx.astype(np.float32)
+
+        # niveau de bruit capteur (pour l'appliquer aux couches synthétiques)
+        hp = self.lum - cv2.GaussianBlur(self.lum, (0, 0), 1.0)
+        self.sensor_sigma = float(np.clip(1.4826 * np.median(np.abs(hp)), 0.5, 6))
+
+        # texture relative : luminance / luminance locale (≈1 en moyenne)
+        local = cv2.GaussianBlur(self.lum, (0, 0), max(1.0, 2.5 * self.ppm))
+        self.tex = np.clip(self.lum / (local + 1.0), 0.4, 1.8)[..., None]
+
+        self._segment()
+
+    def m(self, meters):
+        """Conversion mètres -> pixels."""
+        return meters * self.ppm
+
+    def noise(self, rng, meters, octaves=3, persistence=0.5):
+        return noise_px((self.h, self.w), rng, self.m(meters), octaves, persistence)
+
+    def segmean(self, a):
+        return np.bincount(self.seg.ravel(), weights=a.ravel(), minlength=self.nseg) / self.area
+
+    def _segment(self):
+        f, img = self.f, self.img
+        house_px = max(3.0, self.m(8))
+        n = int(self.h * self.w / house_px ** 2)
+        self.seg = slic(img, n_segments=max(50, n), compactness=10, sigma=0.5,
+                        start_label=0, channel_axis=-1).astype(np.int32)
+        self.nseg = int(self.seg.max()) + 1
+        self.area = np.maximum(np.bincount(self.seg.ravel(), minlength=self.nseg), 1).astype(np.float64)
+
+        r, g, b = f[..., 0], f[..., 1], f[..., 2]
+        exg = (2 * g - r - b) / (r + g + b + 1)
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB).astype(np.float32)
+        k = min(255, int(5 * house_px) | 1)
+        bg = cv2.medianBlur(self.lum.astype(np.uint8), k).astype(np.float32)
+
+        E, L, B, A = self.segmean(exg), self.segmean(self.lum), self.segmean(bg), self.segmean(lab[..., 1])
+        SD = np.sqrt(np.maximum(self.segmean(self.lum ** 2) - L ** 2, 0))
+        counts = np.bincount(self.seg.ravel() * 7 + self.cls.ravel(), minlength=self.nseg * 7)
+        seg_cls = counts.reshape(self.nseg, 7).argmax(1)
+        self.seg_cls = seg_cls
+
+        # végétation : seuil d'Otsu sur l'indice de verdure (s'adapte à la teinte de l'image)
+        try:
+            tv = max(threshold_otsu(E), 0.02)
+        except ValueError:
+            tv = 0.08
+        veg = (E > tv) | ((seg_cls == FOREST) & (E > tv - 0.03))
+        water = seg_cls == WATER
+        veg &= ~water
+
+        # toits : objets non végétaux qui contrastent avec leur voisinage
+        s = self.lum.std() + 1e-6
+        roofness = np.abs(L - B) / s + np.maximum(A - 132, 0) / 8 + SD / s
+        urban = seg_cls == URBAN
+        frac_urban = self.area[urban].sum() / self.area.sum()
+        cand = ~veg & ~water & (urban if frac_urban > 0.02 else np.ones_like(urban))
+        roof = np.zeros(self.nseg, bool)
+        if cand.any():
+            keep = 0.60 if frac_urban > 0.02 else 0.15
+            thr = np.quantile(roofness[cand], 1 - keep)
+            roof = cand & (roofness >= thr)
+
+        # eau visible dans l'image (canaux, bassins...) souvent absente du masque.
+        # Le masque DeepGlobe est fiable hors des villes (forêt, cultures,
+        # prairie) : une forêt sombre et lisse ressemble à de l'eau vue de
+        # dessus, donc on ne contredit le masque que dans les zones
+        # "urbain"/"inconnu", où il est trop grossier (canaux, bassins en ville ;
+        # l'indice de verdure ne suffit pas : ces canaux sont souvent verts).
+        if self.has_mask:
+            allowed = np.isin(self.cls, [URBAN, UNKNOWN])
+        else:
+            allowed = np.ones_like(self.cls, bool)
+        img_water = self._detect_water(L, allowed)
+        water_px = (self.cls == WATER) | img_water
+        ws = self.segmean(water_px.astype(np.float32)) > 0.5
+        veg &= ~ws
+        roof &= ~ws
+        water = water | ws
+
+        self.veg_s, self.roof_s, self.water_s = veg, roof, water
+        self.veg = veg[self.seg] & ~water_px
+        self.roof = roof[self.seg] & ~water_px
+        self.water = water_px
+        self.ground = ~self.veg & ~self.roof & ~self.water
+        self.cent_x = self.segmean(self.xx)
+        self.cent_y = self.segmean(self.yy)
+
+    def _detect_water(self, L, allowed):
+        """Eau = objets sombres, lisses (peu texturés) et pas rougeâtres.
+        Seuillage à hystérésis : on garde les zones "probables" reliées à une
+        zone "sûre", ce qui suit les canaux sur toute leur longueur."""
+        f, lum = self.f, self.lum
+        k = max(1.0, self.m(3))
+        mu = cv2.GaussianBlur(lum, (0, 0), k)
+        sd = np.sqrt(np.maximum(cv2.GaussianBlur(lum ** 2, (0, 0), k) - mu ** 2, 0))
+        SD = self.segmean(sd)
+        BR = self.segmean(f[..., 2] - f[..., 0])
+        Lm, SDm = np.median(L), np.median(SD)
+        strong = ((L < 0.75 * Lm) & (SD < 0.6 * SDm) & (BR > -10))[self.seg] & allowed
+        weak = ((L < 0.88 * Lm) & (SD < 0.85 * SDm) & (BR > -14))[self.seg] & allowed
+        strong = clean_mask(strong, self.m(2), self.m(25) ** 2)
+        if not strong.any():
+            return strong
+        n, lab = cv2.connectedComponents((weak | strong).astype(np.uint8), connectivity=8)
+        keep = np.zeros(n, bool)
+        keep[np.unique(lab[strong])] = True
+        keep[0] = False
+        return clean_mask(keep[lab], self.m(1.5), self.m(25) ** 2)
+
+    # --- finitions photométriques -----------------------------------------
+    def finish(self, out, alpha, rng):
+        """Ajoute le bruit capteur aux zones synthétiques et borne l'image."""
+        grain = rng.normal(0, self.sensor_sigma, out.shape[:2]).astype(np.float32)[..., None]
+        out = out + grain * np.clip(alpha, 0, 1)[..., None]
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def scramble(self, f, rng, amp_m, grain_m):
+        """Brouille localement les pixels (aspect gravats / débris)."""
+        amp = self.m(amp_m)
+        dx = (self.noise(rng, grain_m, 2) - 0.5) * 2 * amp + rng.normal(0, amp * 0.35, (self.h, self.w))
+        dy = (self.noise(rng, grain_m, 2) - 0.5) * 2 * amp + rng.normal(0, amp * 0.35, (self.h, self.w))
+        return cv2.remap(f, (self.xx + dx).astype(np.float32), (self.yy + dy).astype(np.float32),
+                         cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+
+    def optics(self, layer):
+        """Léger flou pour que la couche synthétique ait la netteté du capteur."""
+        return cv2.GaussianBlur(layer, (0, 0), max(0.4, 0.3 * self.ppm))
+
+
+# ---------------------------------------------------------------------------
+# Désastre 1 : inondation
+# ---------------------------------------------------------------------------
+def simulate_flood(sc, rng, severity=0.35):
+    h, w = sc.h, sc.w
+    f = sc.f
+    water = sc.water
+    region = ~water & (sc.cls != UNKNOWN)
+
+    # altitude fictive : distance à l'eau + relief multi-échelle
+    # l'eau monte depuis les rivières/canaux/bassins : plus on en est loin, plus
+    # le terrain est "haut" ; le relief rend le contour de la crue irrégulier
+    relief = sc.noise(rng, 250, 3)
+    micro = sc.noise(rng, 25, 2)
+    if water.mean() > 0.002:
+        dist = cv2.distanceTransform((~water).astype(np.uint8), cv2.DIST_L2, 5)
+        dist = normalize(dist ** 0.8)
+        elev = 0.75 * dist + 0.21 * relief + 0.04 * micro
+    else:  # aucune eau visible : vallée fictive traversant l'image
+        dist = normalize(np.abs(noise_px((h, w), rng, w / 1.5, 2) - 0.5))
+        elev = 0.57 * dist + 0.39 * relief + 0.04 * micro
+    elev = elev + np.select([sc.cls == FOREST, sc.cls == BARREN], [0.04, 0.06], 0.0)
+    # accrochage aux objets : un jardin ou une rue est inondé "en bloc"
+    elev = 0.7 * elev + 0.3 * sc.segmean(elev)[sc.seg]
+
+    flooded, level = quantile_mask(elev, region, severity)
+    flooded = clean_mask(flooded, sc.m(3), sc.m(20) ** 2)
+    lo = elev[flooded].min() if flooded.any() else 0.0
+    depth = np.clip((level - elev) / (level - lo + 1e-6), 0, 1) * flooded
+
+    # couleur de l'eau de crue (boueuse), plus sombre là où elle est profonde
+    # eau chargée de sédiments : ocre clair, nettement distincte de la ville
+    shallow = np.array([156, 138, 106], np.float32)
+    deep = np.array([126, 112, 86], np.float32)
+    d = (depth ** 0.6)[..., None]
+    col = shallow * (1 - d) + deep * d
+    col = col + (sc.noise(rng, 120, 2)[..., None] - 0.5) * 18      # turbidité
+    col = col + (sc.noise(rng, 15, 2)[..., None] - 0.5) * 6         # vaguelettes / reflets
+
+    # transparence selon l'objet : sol/rue noyés, arbres en partie émergés,
+    # chaque maison a une hauteur aléatoire : les plus basses sont submergées
+    roof = cv2.erode(sc.roof.astype(np.uint8), disk(sc.m(0.6))).astype(bool)
+    roof_h = rng.uniform(0.0, 1.0, sc.nseg)[sc.seg]
+    submerged = roof & (depth > roof_h)
+    a_ground = 0.88 + 0.12 * smoothstep(depth / 0.2)
+    a_veg = 0.35 + 0.45 * depth
+    a_roof = np.where(submerged, 0.9, 0.0)
+    alpha = np.where(roof, a_roof, np.where(sc.veg, a_veg, a_ground))
+    alpha = alpha * soft(flooded, sc.m(0.6))
+    # la rivière existante devient boueuse
+    alpha = np.maximum(alpha, soft(water, sc.m(1)) * 0.90)
+
+    col = sc.optics(col)
+    # la canopée et les toits gardent leur texture, assombris par l'humidité
+    under = f * np.where(sc.veg | roof, 0.85, 1.0)[..., None]
+    out = blend(under, col, alpha)
+
+    # ombre portée des toits/arbres sur l'eau (décalage soleil)
+    caster = ((roof | sc.veg) & flooded).astype(np.float32)
+    shadow = shift(caster, sc.m(1.2), sc.m(1.2)) * (1 - caster) * flooded
+    out = out * (1 - 0.25 * soft(shadow, sc.m(0.4)))[..., None]
+
+    # sol mouillé autour de la zone inondée + laisse de débris
+    ring = cv2.dilate(flooded.astype(np.uint8), disk(sc.m(5))).astype(bool) & ~flooded & ~water
+    wet = soft(ring, sc.m(2)) * (1 - soft(flooded, sc.m(0.5)))
+    out = out * (1 - 0.22 * wet)[..., None]
+    edge = cv2.dilate(flooded.astype(np.uint8), disk(sc.m(0.8))).astype(bool) & ~flooded
+    debris = edge & (sc.noise(rng, 2, 2) > 0.55)
+    out = blend(out, np.array([150, 138, 112], np.float32) * sc.tex, soft(debris, 0.6) * 0.5)
+
+    return sc.finish(out, alpha * 0.5, rng), flooded
+
+
+# ---------------------------------------------------------------------------
+# Désastre 2 : incendie
+# ---------------------------------------------------------------------------
+def simulate_fire(sc, rng, severity=0.35, active=None):
+    h, w = sc.h, sc.w
+    f = sc.f
+    region = ~sc.water & (sc.cls != UNKNOWN)
+    if active is None:
+        active = rng.random() < 0.3
+
+    # allumage dans la végétation si possible, propagation poussée par le vent
+    y0, x0 = random_point(sc.veg & region if (sc.veg & region).any() else region, rng)
+    theta = rng.uniform(0, 2 * np.pi)
+    wx, wy = np.cos(theta), np.sin(theta)
+    dx, dy = sc.xx - x0, sc.yy - y0
+    along = dx * wx + dy * wy
+    across = -dx * wy + dy * wx
+    along_s = np.where(along > 0, along / 2.2, along * 1.5)
+    d = normalize(np.sqrt(along_s ** 2 + across ** 2))
+    fuel = np.where(sc.veg, -0.06, np.where(sc.roof, 0.0, 0.04))
+    spread = 0.55 * d + 0.35 * sc.noise(rng, 200, 3) + 0.10 * sc.noise(rng, 20, 2) + fuel
+    spread = 0.4 * spread + 0.6 * sc.segmean(spread)[sc.seg]
+
+    burned, level = quantile_mask(spread, region, severity)
+    burned = clean_mask(burned, sc.m(1.5), sc.m(15) ** 2)
+    lo = spread[burned].min() if burned.any() else 0.0
+    inten = np.clip((level - spread) / (level - lo + 1e-6), 0, 1)[..., None]
+
+    # quelques maisons sont épargnées (pare-feu, chance...)
+    survive_s = rng.random(sc.nseg) < 0.12
+    house = sc.roof & burned & ~survive_s[sc.seg]
+    survivor = sc.roof & burned & survive_s[sc.seg]
+    veg = sc.veg & burned
+    ground = burned & ~sc.roof & ~sc.veg
+    tex = sc.tex
+
+    # arbres : canopée noircie au centre, roussie en périphérie (texture conservée)
+    char = np.array([44, 40, 37], np.float32)
+    scorch = np.array([86, 72, 58], np.float32)
+    t = inten ** 0.4
+    veg_col = (scorch * (1 - t) + char * t) * tex ** 1.5
+
+    # sol et routes : même texture, désaturée et assombrie par la suie
+    g = luminance(f)[..., None]
+    soot = 0.62 - 0.22 * t
+    ground_col = (g * 0.8 + f * 0.2) * soot * np.array([1.0, 0.97, 0.94], np.float32)
+    ground_col = ground_col * (0.85 + 0.3 * sc.noise(rng, 8, 2))[..., None]
+
+    # maisons : empreinte de cendres grises (structure du toit conservée),
+    # tôles rouillées et débris carbonisés épars, murs noircis
+    hl = sc.scramble(f, rng, 0.5, 1.5)
+    ash = luminance(hl)[..., None] * 0.55 + np.array([58, 56, 54], np.float32)
+    ash = ash * (0.9 + 0.2 * sc.noise(rng, 3, 2))[..., None] * np.array([1.04, 1.0, 0.93], np.float32)
+    rust = (sc.noise(rng, 2.5, 2) > 0.8)[..., None]
+    ash = np.where(rust, ash * np.array([1.05, 0.72, 0.52], np.float32), ash)
+    debris = (sc.noise(rng, 1.5, 2) > 0.62)[..., None]
+    house_col = np.where(debris, ash * 0.45, ash)
+    outline = house & ~cv2.erode(house.astype(np.uint8), disk(sc.m(0.7))).astype(bool)
+    house_col = np.where(outline[..., None], house_col * 0.45, house_col)
+
+    layer = np.where(house[..., None], house_col, np.where(veg[..., None], veg_col, ground_col))
+    layer = sc.optics(layer)
+    alpha = soft(burned & ~survivor, sc.m(0.5)) * 0.97
+    out = blend(f, layer, alpha)
+
+    # végétation roussie juste à l'extérieur du périmètre
+    halo = cv2.dilate(burned.astype(np.uint8), disk(sc.m(6))).astype(bool) & ~burned & sc.veg
+    out = blend(out, f * np.array([0.95, 0.85, 0.7], np.float32), soft(halo, sc.m(2)) * 0.4)
+
+    if active:
+        # front de flammes du côté sous le vent + panache de fumée
+        ring = cv2.dilate(burned.astype(np.uint8), disk(sc.m(3))).astype(bool) & ~burned & region
+        down = along > np.quantile(along[burned], 0.5) if burned.any() else ring
+        front = ring & down & (sc.noise(rng, 2, 2) > 0.5)
+        glow = np.clip(soft(front, sc.m(0.6)) * 2, 0, 1)
+        flame = np.array([255, 140, 40], np.float32) + glow[..., None] * np.array([0, 80, 60], np.float32)
+        out = blend(out, flame, glow * 0.9)
+        out += soft(front, sc.m(5))[..., None] * np.array([45, 18, 0], np.float32)
+        src = front.astype(np.float32)
+        plume = np.zeros((h, w), np.float32)
+        step = sc.m(6)
+        for i in range(1, 30):
+            plume += shift(src, wx * step * i, wy * step * i) * (0.94 ** i)
+            src = cv2.GaussianBlur(src, (0, 0), sc.m(1.0))
+        plume = normalize(cv2.GaussianBlur(plume, (0, 0), sc.m(6)))
+        plume *= 0.4 + 0.6 * sc.noise(rng, 60, 3)
+        smoke_a = np.clip(plume * 1.2, 0, 0.6)
+        out = blend(out, np.array([196, 194, 190], np.float32) - smoke_a[..., None] * 50, smoke_a)
+        alpha = np.maximum(alpha, smoke_a)
+
+    damage = burned & ~survivor
+    return sc.finish(out, alpha, rng), damage
+
+
+# ---------------------------------------------------------------------------
+# Désastre 3 : séisme
+# ---------------------------------------------------------------------------
+def simulate_earthquake(sc, rng, severity=0.4):
+    f = sc.f
+    target_s = sc.roof_s.copy()
+    if target_s.sum() < 20:  # presque pas de bâti : on prend les objets non végétaux
+        target_s = ~sc.veg_s & ~sc.water_s
+
+    # épicentre sur un bâtiment ; probabilité d'effondrement décroissante avec la distance
+    idx = np.nonzero(target_s)[0]
+    c = idx[rng.integers(len(idx))] if len(idx) else 0
+    ex, ey = sc.cent_x[c], sc.cent_y[c]
+    dist = np.hypot(sc.cent_x - ex, sc.cent_y - ey)
+    dist = dist / (dist[target_s].max() + 1e-6) if len(idx) else dist
+    local = sc.segmean(sc.noise(rng, 80, 2))  # effets de site (sol meuble...)
+    score = 0.55 * dist + 0.30 * local + 0.15 * rng.random(sc.nseg)
+    score[~target_s] = np.inf
+
+    n_t = int(target_s.sum())
+    order = np.argsort(score)
+    collapsed_s = np.zeros(sc.nseg, bool)
+    partial_s = np.zeros(sc.nseg, bool)
+    n_c = int(severity * n_t)
+    collapsed_s[order[:n_c]] = True
+    partial_s[order[n_c:n_c + int(0.6 * severity * n_t)]] = True
+
+    collapsed = collapsed_s[sc.seg]
+    partial = partial_s[sc.seg]
+
+    # gravats : bâtiment brouillé, désaturé, mêlé de béton et d'ombres de débris
+    spill = cv2.dilate(collapsed.astype(np.uint8), disk(sc.m(1.2))).astype(bool)
+    spill &= (sc.noise(rng, 1.5, 2) > 0.45) | collapsed
+    spill &= ~sc.water
+    scr = sc.scramble(f, rng, 2.5, 1.5)
+    gray = luminance(scr)[..., None]
+    scr = scr * 0.65 + gray * 0.35
+    concrete = np.array([172, 166, 154], np.float32)
+    chunks = sc.noise(rng, 1.5, 2)[..., None]
+    rubble = np.where(chunks > 0.62, scr * 0.5 + concrete * 0.5 * 1.1, scr)   # blocs de béton clairs
+    rubble = np.where(chunks < 0.3, rubble * 0.5, rubble)                    # vides / ombres entre débris
+    rubble = cv2.GaussianBlur(rubble, (0, 0), 0.5)
+    a_rub = np.where(collapsed, 1.0, 0.75) * spill
+    out = blend(f, rubble, soft(a_rub, 0.6))
+
+    # toits endommagés : trous sombres et tuiles/tôles déplacées
+    dmg_spots = partial & (sc.noise(rng, 1.2, 2) > 0.62)
+    part = sc.scramble(f, rng, 0.8, 1.0) * 0.9
+    part = np.where((sc.noise(rng, 0.6, 1) > 0.7)[..., None], part * 0.5, part)
+    out = blend(out, part, soft(dmg_spots, 0.6) * 0.85)
+
+    # poussière légère autour des effondrements
+    dust = soft(spill, sc.m(10)) * 0.05 * sc.noise(rng, 30, 2)
+    out = blend(out, np.array([186, 178, 162], np.float32), dust)
+
+    alpha = np.maximum(soft(a_rub, 0.6), soft(dmg_spots, 0.6))
+    damage = spill | partial
+    return sc.finish(out, alpha, rng), damage
+
+
+# ---------------------------------------------------------------------------
+# Désastre 4 : tornade
+# ---------------------------------------------------------------------------
+# Différences avec le séisme (observations NWS / imagerie satellite) :
+#  - géométrie : couloir étroit (100 m à ~1 km) et long, bords nets, parfois
+#    discontinu (la tornade se soulève), au lieu d'une zone radiale autour
+#    d'un épicentre ;
+#  - les dégâts touchent tout ce qui est dans le couloir : la végétation est
+#    arrachée (arbres cassés couchés en motif CONVERGENT vers l'axe), le sol est
+#    décapé (cicatrice brun clair visible depuis l'espace) ;
+#  - les bâtiments ne s'effondrent pas sur place : le vent arrache les toits
+#    (charpente apparente) ou balaie la maison jusqu'à la dalle, et les débris
+#    sont dispersés loin, dans le sens du vent ; bâches bleues sur les toits
+#    endommagés quelques jours après.
+def _profile_1d(rng, n, knots, lo, hi):
+    """Courbe 1D lisse aléatoire (n échantillons) entre lo et hi."""
+    k = rng.random(knots).astype(np.float32)
+    c = cv2.resize(k.reshape(1, -1), (n, 1), interpolation=cv2.INTER_CUBIC).ravel()
+    return lo + (hi - lo) * np.clip(c, 0, 1)
+
+
+def simulate_tornado(sc, rng, severity=0.35, tarps=None):
+    h, w = sc.h, sc.w
+    f = sc.f
+    if tarps is None:
+        tarps = rng.random() < 0.5   # image prise quelques jours après : bâches
+
+    # --- trajectoire : droite légèrement sinueuse passant par une zone bâtie
+    central = np.zeros((h, w), bool)
+    central[h // 4: 3 * h // 4, w // 4: 3 * w // 4] = True
+    start = sc.roof & central
+    y0, x0 = random_point(start if start.any() else central, rng)
+    th = rng.uniform(0, 2 * np.pi)
+    mx, my = np.cos(th), np.sin(th)             # direction de déplacement
+    nx, ny = -my, mx                            # normale
+    s = (sc.xx - x0) * mx + (sc.yy - y0) * my   # abscisse le long de la trace
+    c = (sc.xx - x0) * nx + (sc.yy - y0) * ny   # distance signée à l'axe
+    D = float(np.hypot(h, w))
+    ss = np.linspace(-D, D, 512)
+    off = (_profile_1d(rng, 512, 6, -1, 1)) * 0.08 * D            # sinuosité
+    base_hw = sc.m(30 + 220 * severity)                              # demi-largeur
+    hw = base_hw * _profile_1d(rng, 512, 9, 0.55, 1.35)              # largeur variable
+    lift = _profile_1d(rng, 512, 12, 0, 1)                           # soulèvements
+    c = c - np.interp(s, ss, off).astype(np.float32)
+    hwp = np.interp(s, ss, hw).astype(np.float32)
+    gate = smoothstep((np.interp(s, ss, lift) - 0.12) / 0.12).astype(np.float32)
+
+    # --- intensité du vent : max sur l'axe, plus forte du côté droit
+    # (vitesse de rotation + vitesse de déplacement), tourbillons secondaires
+    u = np.abs(c) / hwp
+    I = smoothstep(1.15 - u) * (1 + 0.25 * np.tanh(c / hwp))
+    I *= 0.7 + 0.6 * sc.noise(rng, 20, 2)
+    I = np.clip(I * gate, 0, 1).astype(np.float32)
+    I[sc.water] = 0
+
+    # direction du vent au sol : déplacement + convergence vers l'axe
+    vx = mx - np.sign(c) * nx * 0.9
+    vy = my - np.sign(c) * ny * 0.9
+    vn = np.hypot(vx, vy) + 1e-6
+    vx, vy = vx / vn, vy / vn
+
+    out = f.copy()
+    tex = sc.tex
+
+    # --- sol : décapage (herbe arrachée -> terre brun clair)
+    soil = np.array([156, 136, 104], np.float32) * tex
+    a_g = np.clip((I - 0.5) / 0.4, 0, 1) * 0.6 * sc.ground
+    out = blend(out, soil, a_g)
+
+    # --- végétation : canopée arrachée, bois mort et terre apparente
+    a_v = np.clip((I - 0.3) / 0.5, 0, 1) * 0.85 * sc.veg
+    dead = (np.array([118, 102, 76], np.float32) * (0.75 + 0.5 * sc.noise(rng, 1.5, 2))[..., None]) * tex
+    out = blend(out, dead, a_v)
+
+    # --- bâtiments, selon l'intensité moyenne reçue par chaque objet
+    Is = sc.segmean(I)[sc.seg]
+    roof = sc.roof
+    destroyed = roof & (Is > 0.7)
+    major = roof & (Is > 0.42) & ~destroyed
+    minor = roof & (Is > 0.18) & ~destroyed & ~major
+
+    # maison balayée : dalle de béton claire + quelques débris
+    slab = np.array([152, 144, 130], np.float32) * (0.9 + 0.2 * sc.noise(rng, 2, 2))[..., None]
+    bits = (sc.noise(rng, 0.8, 2) > 0.6)[..., None]
+    wood = np.array([140, 112, 82], np.float32)
+    slab = np.where(bits, sc.scramble(f, rng, 3, 1) * 0.5 + wood * 0.5, slab)
+    out = blend(out, sc.optics(slab), soft(destroyed, 0.6))
+
+    # toit arraché : charpente / plancher sombre apparent sur une partie du toit
+    exposed = major & (sc.noise(rng, 3, 2) > 0.35)
+    deck = np.array([100, 82, 62], np.float32) * tex * (0.8 + 0.4 * sc.noise(rng, 0.8, 2))[..., None]
+    out = blend(out, deck, soft(exposed, 0.6) * 0.9)
+
+    # dégâts légers : tuiles/bardeaux manquants
+    spots = minor & (sc.noise(rng, 1.2, 2) > 0.68)
+    out = blend(out, f * 0.7 + 30, soft(spots, 0.5) * 0.8)
+
+    # bâches bleues sur une partie des toits endommagés
+    tarp = np.zeros((h, w), bool)
+    if tarps:
+        pick = (rng.random(sc.nseg) < 0.45)[sc.seg]
+        core = cv2.erode((minor | major).astype(np.uint8), disk(sc.m(1))).astype(bool)
+        tarp = core & pick & (sc.noise(rng, 4, 2) > 0.3)
+        blue = np.array([48, 98, 186], np.float32) * tex ** 0.5
+        out = blend(out, blue, soft(tarp, 0.5) * 0.95)
+
+    # --- débris dispersés : morceaux des toits emportés dans le sens du vent
+    dist = sc.m(25) * sc.noise(rng, 5, 2)
+    mapx = (sc.xx - vx * dist).astype(np.float32)
+    mapy = (sc.yy - vy * dist).astype(np.float32)
+    src = cv2.remap(f, mapx, mapy, cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+    frag = (sc.noise(rng, 0.9, 1) > (0.94 - 0.24 * I)) & (I > 0.15) & ~tarp
+    deb = 0.7 * src + 0.3 * wood * (0.7 + 0.6 * sc.noise(rng, 0.6, 1))[..., None]
+    white = (sc.noise(rng, 0.7, 1) > 0.92)[..., None]   # isolant, plaques de plâtre
+    deb = np.where(white, np.array([190, 186, 178], np.float32), deb)
+    out = blend(out, deb, soft(frag, 0.5) * 0.9)
+
+    # --- arbres cassés / déracinés, couchés dans le sens du vent (convergent)
+    trunks = np.zeros((h, w), np.uint8)
+    shadow = np.zeros((h, w), np.uint8)
+    cand = sc.veg & (I > 0.3)
+    if cand.any():
+        ys, xs = np.nonzero(cand)
+        p = I[ys, xs] / I[ys, xs].sum()
+        n = int(I[cand].sum() / max(1.0, sc.m(7)) ** 2)
+        n = min(n, 6000)
+        idx = rng.choice(len(ys), size=n, p=p) if n > 0 else []
+        th_ = max(1, int(round(sc.m(0.5))))
+        sh = max(1, int(round(sc.m(0.7))))
+        for i in idx:
+            y, x = ys[i], xs[i]
+            ang = np.arctan2(vy[y, x], vx[y, x]) + rng.normal(0, 0.25)
+            L = sc.m(rng.uniform(4, 9))
+            x2, y2 = int(x + np.cos(ang) * L), int(y + np.sin(ang) * L)
+            cv2.line(shadow, (x + sh, y + sh), (x2 + sh, y2 + sh), 255, th_, cv2.LINE_AA)
+            cv2.line(trunks, (x, y), (x2, y2), 255, th_, cv2.LINE_AA)
+    out = blend(out, out * 0.45, shadow.astype(np.float32) / 255 * 0.8)
+    out = blend(out, np.array([150, 138, 116], np.float32), trunks.astype(np.float32) / 255 * 0.9)
+
+    alpha = np.clip(np.maximum.reduce([a_g, a_v, soft(destroyed | exposed | spots | tarp, 0.6),
+                                       frag.astype(np.float32)]), 0, 1)
+    damage = (I > 0.25) & ~sc.water
+    return sc.finish(out, alpha, rng), damage
+
+
+SIMULATORS = {
+    "flood": simulate_flood,
+    "fire": simulate_fire,
+    "earthquake": simulate_earthquake,
+    "tornado": simulate_tornado,
+}
+
+
+def apply_disaster(scene, kind, rng, severity=None):
+    if severity is None:
+        severity = float(rng.uniform(0.2, 0.5))
+    out, dmg = SIMULATORS[kind](scene, rng, severity)
+    return out, dmg, severity
+
+
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+def colorize_classes(cls):
+    pal = np.zeros((7, 3), np.uint8)
+    for idx, (_, rgb) in CLASSES.items():
+        pal[idx] = rgb
+    return pal[cls]
+
+
+def label(img, text):
+    img = img.copy()
+    s = img.shape[1] / 600
+    cv2.rectangle(img, (0, 0), (img.shape[1], int(34 * s)), (0, 0, 0), -1)
+    cv2.putText(img, text, (int(8 * s), int(24 * s)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7 * s, (255, 255, 255), max(1, int(2 * s)), cv2.LINE_AA)
+    return img
+
+
+ANALYSIS_COLORS = {          # couleurs du panneau "analyse"
+    "toit": (220, 60, 40),
+    "vegetation": (40, 200, 60),
+    "eau": (30, 110, 255),
+    "sol/route": (200, 190, 160),
+}
+
+
+def colorize_analysis(sc):
+    """Analyse objet par objet faite par le script (toits, végétation, eau, sol)."""
+    out = np.empty(sc.img.shape, np.uint8)
+    out[:] = ANALYSIS_COLORS["sol/route"]
+    out[sc.roof] = ANALYSIS_COLORS["toit"]
+    out[sc.veg] = ANALYSIS_COLORS["vegetation"]
+    out[sc.water] = ANALYSIS_COLORS["eau"]
+    # mélange avec l'image pour garder les repères visuels
+    return (0.65 * out + 0.35 * sc.img).astype(np.uint8)
+
+
+def legend(tile):
+    s = tile.shape[1] / 600
+    y = tile.shape[0] - int(10 * s)
+    x = int(8 * s)
+    for name, col in ANALYSIS_COLORS.items():
+        cv2.rectangle(tile, (x, y - int(16 * s)), (x + int(16 * s), y), col, -1)
+        cv2.rectangle(tile, (x, y - int(16 * s)), (x + int(16 * s), y), (0, 0, 0), 1)
+        cv2.putText(tile, name, (x + int(22 * s), y - int(2 * s)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5 * s, (0, 0, 0), max(1, int(3 * s)), cv2.LINE_AA)
+        cv2.putText(tile, name, (x + int(22 * s), y - int(2 * s)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5 * s, (255, 255, 255), max(1, int(1 * s)), cv2.LINE_AA)
+        x += int((40 + 11 * len(name)) * s)
+    return tile
+
+
+def comparison(scene, results, panel=600):
+    """Planche sur 3 colonnes :
+    original | masque officiel DeepGlobe | analyse du script
+    puis pour chaque désastre : image | contour des dégâts | masque des dégâts."""
+    def rs(a, interp=cv2.INTER_AREA):
+        return cv2.resize(a, (panel, panel), interpolation=interp)
+
+    tiles = [label(rs(scene.img), "original"),
+             label(rs(colorize_classes(scene.cls), cv2.INTER_NEAREST),
+                   "classes DeepGlobe (officiel)" if scene.has_mask else "classes estimees (pas de masque)"),
+             legend(label(rs(colorize_analysis(scene), cv2.INTER_NEAREST), "analyse du script"))]
+    for kind, (out, dmg, sev) in results.items():
+        o = rs(out)
+        m = rs(dmg.astype(np.uint8) * 255, cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        ov = o.copy()
+        cv2.drawContours(ov, contours, -1, (255, 0, 0), 2)
+        tiles.append(label(o, "%s (sev %.2f)" % (kind, sev)))
+        tiles.append(label(ov, "%s - degats %.0f%%" % (kind, 100 * dmg.mean())))
+        tiles.append(label(cv2.cvtColor(m, cv2.COLOR_GRAY2RGB), "%s - masque" % kind))
+    return np.vstack([np.hstack(tiles[i:i + 3]) for i in range(0, len(tiles), 3)])
+
+
+def zoom_view(img, results, crop=400):
+    """Zoom pleine résolution sur une zone en bordure des dégâts, pour juger le réalisme."""
+    h, w = img.shape[:2]
+    crop = min(crop, h, w)
+    half = crop // 2
+    tiles = []
+    for kind, (out, dmg, _) in results.items():
+        cov = cv2.blur(dmg.astype(np.float32), (crop, crop))
+        cov[:half, :] = 9
+        cov[h - half:, :] = 9
+        cov[:, :half] = 9
+        cov[:, w - half:] = 9
+        y, x = np.unravel_index(np.argmin(np.abs(cov - 0.6)), cov.shape)
+        y0, x0 = min(max(0, y - half), h - crop), min(max(0, x - half), w - crop)
+        tiles.append(label(img[y0:y0 + crop, x0:x0 + crop], "original"))
+        tiles.append(label(out[y0:y0 + crop, x0:x0 + crop], kind + " (zoom)"))
+    return np.vstack([np.hstack(tiles[i:i + 2]) for i in range(0, len(tiles), 2)])
+
+
+# ---------------------------------------------------------------------------
+# Modes d'exécution
+# ---------------------------------------------------------------------------
+def run_single(args):
+    rng = np.random.default_rng(args.seed)
+    img, cls, has_mask = load_pair(args.image, args.mask, args.size)
+    scene = Scene(img, cls, has_mask)
+    kinds = DISASTERS if args.type == "all" else (args.type,)
+    stem = os.path.basename(args.image).replace("_sat.jpg", "").rsplit(".", 1)[0]
+    results = {}
+    for kind in kinds:
+        out, dmg, sev = apply_disaster(scene, kind, rng, args.severity)
+        results[kind] = (out, dmg, sev)
+        write_rgb(os.path.join(args.out, "%s_%s.jpg" % (stem, kind)), out)
+        cv2.imwrite(os.path.join(args.out, "%s_%s_damage.png" % (stem, kind)),
+                    dmg.astype(np.uint8) * 255)
+        print("%-10s severite=%.2f  zone endommagee=%.1f%%" % (kind, sev, 100 * dmg.mean()))
+    write_rgb(os.path.join(args.out, "%s_comparaison.jpg" % stem), comparison(scene, results))
+    write_rgb(os.path.join(args.out, "%s_zoom.jpg" % stem), zoom_view(img, results))
+    print("Resultats ecrits dans", os.path.abspath(args.out))
+
+
+def run_dataset(args):
+    """Construit un dataset de classification : none / flood / fire / earthquake."""
+    rng = np.random.default_rng(args.seed)
+    sats = sorted(glob(os.path.join(args.dataset, "*_sat.jpg")))
+    if not sats:
+        sys.exit("Aucune image *_sat.jpg dans %s" % args.dataset)
+    if args.n:
+        sats = [sats[i] for i in rng.permutation(len(sats))[: args.n]]
+    kinds = DISASTERS if args.type == "all" else (args.type,)
+
+    os.makedirs(os.path.join(args.out, "masks"), exist_ok=True)
+    csv_path = os.path.join(args.out, "labels.csv")
+    with open(csv_path, "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["image", "label", "source", "severity", "damaged_ratio", "damage_mask"])
+        for i, sat in enumerate(sats, 1):
+            img, cls, has_mask = load_pair(sat, None, args.size)
+            scene = Scene(img, cls, has_mask)
+            stem = os.path.basename(sat).replace("_sat.jpg", "")
+            name = "none/%s.jpg" % stem
+            write_rgb(os.path.join(args.out, name), img)
+            wr.writerow([name, "none", sat, 0, 0, ""])
+            for kind in kinds:
+                out, dmg, sev = apply_disaster(scene, kind, rng, args.severity)
+                name = "%s/%s_%s.jpg" % (kind, stem, kind)
+                mname = "masks/%s_%s.png" % (stem, kind)
+                write_rgb(os.path.join(args.out, name), out)
+                cv2.imwrite(os.path.join(args.out, mname), dmg.astype(np.uint8) * 255)
+                wr.writerow([name, kind, sat, round(sev, 3), round(float(dmg.mean()), 4), mname])
+            print("[%d/%d] %s" % (i, len(sats), stem))
+    print("Dataset ecrit dans", os.path.abspath(args.out), "- labels :", csv_path)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Genere des images satellites avec desastre (DeepGlobe).")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--image", help="image *_sat.jpg a transformer")
+    src.add_argument("--dataset", help="dossier contenant les *_sat.jpg (+ *_mask.png)")
+    p.add_argument("--mask", help="masque *_mask.png (deduit automatiquement sinon)")
+    p.add_argument("--type", default="all", choices=("all",) + DISASTERS)
+    p.add_argument("--severity", type=float, default=None,
+                   help="fraction de la zone eligible touchee (0-1), aleatoire 0.2-0.5 par defaut")
+    p.add_argument("--size", type=int, default=None,
+                   help="redimensionner (ex. 1024) ; en dessous de ~1000 px les maisons deviennent trop petites")
+    p.add_argument("--n", type=int, default=None, help="mode dataset : nombre d'images source")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--out", default="sortie_desastre")
+    args = p.parse_args(argv)
+    if args.image:
+        run_single(args)
+    else:
+        run_dataset(args)
+
+
+if __name__ == "__main__":
+    main()

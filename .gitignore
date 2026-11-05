@@ -1,0 +1,12 @@
+# Dataset DeepGlobe (2,8 Go) : à télécharger depuis Kaggle, voir README
+dataset/
+
+# Sorties générées par le script (recréables)
+sortie/
+sortie_full/
+sortie_desastre/
+dataset_desastre/
+
+# Python
+__pycache__/
+*.pyc
