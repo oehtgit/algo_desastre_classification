@@ -11,7 +11,25 @@ Ce projet prend une image satellite **saine** du dataset DeepGlobe et fabrique, 
 
 Pour chaque image générée, le script produit aussi un **masque binaire des dégâts** et un **label**. L'objectif est de constituer un jeu de données pour entraîner/tester un modèle de **classification** (`none` / `flood` / `fire` / `earthquake` / `tornado`) ou de **segmentation des dégâts**.
 
-> **Nouveau : images de drone à basse altitude.** Le script `algo_desastre_drone.py` applique les mêmes simulateurs au *Semantic Drone Dataset* et produit des masques au style RescueNet. Voir la [section 9](#9-images-de-drone-à-basse-altitude--algo_desastre_dronepy).
+> **Nouveau : images de drone à basse altitude.** Le script `algo_desastre_drone.py` applique les mêmes simulateurs à des images de drone et produit des masques au style RescueNet. Voir la [section 9](#9-images-de-drone--algo_desastre_dronepy).
+
+## Compte rendu : tornade sur images de drone
+
+📄 **[compte_rendu_tornade.pdf](compte_rendu_tornade.pdf)** (4 pages) résume le travail le plus récent :
+
+- **Objectif :** générer des images de drone avec dégâts de tornade et leurs masques au style RescueNet (fond, route, bâtiment intact, bâtiment endommagé), pour compléter RescueNet lors de l'entraînement d'un modèle PSPNet.
+- **Données :** 385 images saines déjà annotées, issues de six datasets publics (InstanceBuilding, Okutama, Semantic Drone Dataset, UDD, VDD, Swiss Drone), avec une comparaison de leur qualité et de leur résolution.
+- **Méthode :** génération procédurale par étapes successives, textures réelles de dégâts de tornade (photos du domaine public ou sous CC0, synthétisées par *image quilting*), et intensité réglable de 0 à 1 : la gravité de chaque bâtiment touché augmente avec l'intensité.
+- **Exemples, limites et reste à faire :** autres catastrophes (inondation, incendie, séisme), routes absentes des masques InstanceBuilding.
+
+Pour générer une évolution de 0 à 1 sur une image (ici Okutama, 6 niveaux), comme dans le compte rendu :
+
+```bash
+python algo_desastre_drone.py --source okutama --image okutama_04_90_015 \
+    --evolution 6 --seed 3 --textures-tornade --morceaux-naturels --out tests_intensite
+```
+
+Les datasets ne sont pas inclus dans le dépôt (plusieurs Go) : ils sont à télécharger séparément.
 
 ---
 
