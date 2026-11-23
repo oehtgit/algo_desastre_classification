@@ -40,3 +40,6 @@ algo_desastre_drone_avant_*.py
 # pages d'erreur HTML enregistrées par erreur en .jpg (téléchargement raté)
 textures_reelles/sources/h9.jpg
 textures_reelles/sources/h12.jpg
+
+# images de démonstration locales
+image/
