@@ -2417,7 +2417,6 @@ def main(argv=None):
     mode.add_argument("--list", action="store_true", help="VDD : afficher les images retenues")
     p.add_argument("--root", default=None, help="dossier du dataset (defaut selon --source)")
     p.add_argument("--type", default="all", choices=("all",) + core.DISASTERS)
-    p.add_argument("--severity", type=float, default=None)
     p.add_argument("--width", type=int, default=None, help="largeur de travail (defaut : 2000 VDD, 1500 SDD)")
     p.add_argument("--n", type=int, default=None, help="mode dataset : nombre d'images")
     p.add_argument("--min-alt", type=float, default=None,
@@ -2426,8 +2425,6 @@ def main(argv=None):
                    help="SDD : part minimale de toit pour garder une image")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--out", default=None)
-    p.add_argument("--sans-textures", action="store_true",
-                   help="gravats 100%% proceduraux (sans les textures reelles)")
     p.add_argument("--textures-tornade", action="store_true",
                    help="tornade : textures de vrais degats de tornade (textures_tornade/)")
     p.add_argument("--morceaux-naturels", action="store_true",
@@ -2444,8 +2441,7 @@ def main(argv=None):
                    help="mode dataset : ecrire aussi les planches dans planches/<desastre>/")
     args = p.parse_args(argv)
 
-    global USE_REAL_TEX, USE_TORNADO_TEX, NATURAL_PIECES
-    USE_REAL_TEX = not args.sans_textures
+    global USE_TORNADO_TEX, NATURAL_PIECES
     USE_TORNADO_TEX = args.textures_tornade
     NATURAL_PIECES = args.morceaux_naturels
     prof = PROFILES[args.source]()
@@ -2490,7 +2486,7 @@ def main(argv=None):
 
     os.makedirs(out_dir, exist_ok=True)
     if args.image:
-        process(prof, args.image, width, kinds, rng, args.severity, out_dir, supersample=args.supersample)
+        process(prof, args.image, width, kinds, rng, None, out_dir, supersample=args.supersample)
         print("Resultats ecrits dans", os.path.abspath(out_dir))
         return
 
@@ -2518,7 +2514,7 @@ def main(argv=None):
         wr.writerow(["image", "desastre", "severite", "batiments", "batiments_endommages",
                      "px_par_m", "source_echelle"])
         for i, image_id in enumerate(ids, 1):
-            for row in process(prof, image_id, width, kinds, rng, args.severity, out_dir,
+            for row in process(prof, image_id, width, kinds, rng, None, out_dir,
                                write_planche="dossiers" if args.planches else False,
                                supersample=args.supersample):
                 wr.writerow(row)
