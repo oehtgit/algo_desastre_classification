@@ -1,6 +1,6 @@
 # Compte rendu : tornade sur images de drone
 
-📄 **[compte_rendu_tornade.pdf](compte_rendu_tornade.pdf)** (4 pages) résume le travail le plus récent :
+📄 **[compte_rendu_tornade.pdf](compte_rendu_tornade.pdf)** (5 pages) résume le travail le plus récent :
 
 - **Objectif :** générer des images de drone avec dégâts de tornade et leurs masques au style RescueNet (fond, route, bâtiment intact, bâtiment endommagé), pour compléter RescueNet lors de l'entraînement d'un modèle PSPNet.
 - **Données :** 385 images saines déjà annotées, issues de six datasets publics (InstanceBuilding, Okutama, Semantic Drone Dataset, UDD, VDD, Swiss Drone), avec une comparaison de leur qualité et de leur résolution.
