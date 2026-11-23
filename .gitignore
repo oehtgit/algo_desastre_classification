@@ -43,3 +43,6 @@ textures_reelles/sources/h12.jpg
 
 # images de démonstration locales
 image/
+
+# variante Stable Diffusion, non utilisée dans le compte rendu (conservée en local)
+inpaint_diffusion.py
