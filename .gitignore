@@ -1,12 +1,38 @@
 # Dataset DeepGlobe (2,8 Go) : à télécharger depuis Kaggle, voir README
 dataset/
+# Semantic Drone Dataset (3,9 Go) : à télécharger depuis Kaggle, voir README
+dataset_drone/
+# VDD (2 Go, accès Hugging Face après acceptation des conditions)
+dataset_vdd/
+VDD/
 
 # Sorties générées par le script (recréables)
 sortie/
 sortie_full/
 sortie_desastre/
 dataset_desastre/
+sortie_drone/
+sortie_vdd/
+dataset_vdd_desastre/
+dataset_drone_desastre/
 
 # Python
 __pycache__/
 *.pyc
+# UDD-6 (520 Mo, Google Drive, voir README)
+dataset_udd/
+
+# Nouveaux datasets et sélection (plusieurs Go, à télécharger séparément)
+nouveau_dataset_1/
+nouveau_dataset_2/
+nouveau_dataset_3/
+dataset_best_sample/
+
+# Sorties, tests et journaux (recréables)
+sortie_*/
+tests/
+tests_*/
+*.log
+
+# Sauvegardes locales du script
+algo_desastre_drone_avant_*.py

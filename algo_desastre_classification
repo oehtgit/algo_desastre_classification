@@ -160,7 +160,12 @@ def noise_px(shape, rng, size_px, octaves=3, persistence=0.5):
     return normalize(out / total)
 
 
+SOFT_CAP_PX = None   # plafond du flou des bords en pixels (None = pas de plafond)
+
+
 def soft(mask, sigma):
+    if SOFT_CAP_PX is not None:
+        sigma = min(sigma, SOFT_CAP_PX)
     if sigma <= 0.3:
         return mask.astype(np.float32)
     return np.clip(cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigma), 0, 1)
@@ -223,14 +228,15 @@ def shift(a, dx, dy):
 class Scene:
     """Image + segmentation en objets (superpixels) + cartes sémantiques."""
 
-    def __init__(self, img, cls, has_mask=True):
+    def __init__(self, img, cls, has_mask=True, ppm=None):
         self.has_mask = has_mask   # vrai masque DeepGlobe (sinon estimation)
         self.img = img
         self.cls = cls
         self.f = img.astype(np.float32)
         self.h, self.w = cls.shape
-        # pixels par mètre (on suppose que la tuile couvre toujours la même zone)
-        self.ppm = (self.w / NATIVE_SIZE) / NATIVE_GSD
+        # pixels par mètre : imposé (images de drone) ou déduit de la taille
+        # (tuile DeepGlobe : toujours la même zone au sol)
+        self.ppm = ppm if ppm else (self.w / NATIVE_SIZE) / NATIVE_GSD
         self.lum = luminance(self.f)
         yy, xx = np.mgrid[0:self.h, 0:self.w]
         self.yy, self.xx = yy.astype(np.float32), xx.astype(np.float32)
@@ -250,7 +256,21 @@ class Scene:
         return meters * self.ppm
 
     def noise(self, rng, meters, octaves=3, persistence=0.5):
-        return noise_px((self.h, self.w), rng, self.m(meters), octaves, persistence)
+        size = self.m(meters)
+        if getattr(self, "fine_detail", False):
+            # images très résolues (drone) : octaves supplémentaires jusqu'à
+            # ~2 px, pour des bords irréguliers au lieu de formes lisses
+            octaves = int(min(9, max(octaves, np.ceil(np.log2(max(2.0, size) / 2.0)))))
+        return noise_px((self.h, self.w), rng, size, octaves, persistence)
+
+    def rad(self, meters):
+        """Rayon morphologique en px, plafonné à 1 % de la petite dimension."""
+        return min(self.m(meters), 0.01 * min(self.h, self.w))
+
+    def min_area(self, meters):
+        """Surface minimale d'une zone (en px) : `meters` de côté, sans
+        dépasser 1 % de l'image (une photo de drone ne couvre que ~20-60 m)."""
+        return min(self.m(meters) ** 2, 0.01 * self.h * self.w)
 
     def segmean(self, a):
         return np.bincount(self.seg.ravel(), weights=a.ravel(), minlength=self.nseg) / self.area
@@ -354,14 +374,18 @@ class Scene:
     def scramble(self, f, rng, amp_m, grain_m):
         """Brouille localement les pixels (aspect gravats / débris)."""
         amp = self.m(amp_m)
-        dx = (self.noise(rng, grain_m, 2) - 0.5) * 2 * amp + rng.normal(0, amp * 0.35, (self.h, self.w))
-        dy = (self.noise(rng, grain_m, 2) - 0.5) * 2 * amp + rng.normal(0, amp * 0.35, (self.h, self.w))
+        # grain individuel plafonné à 2 px : au-delà, les gravats deviennent un
+        # bruit "poivre et sel" sur les images très résolues (drone)
+        jit = min(amp * 0.35, 2.0)
+        dx = (self.noise(rng, grain_m, 2) - 0.5) * 2 * amp + rng.normal(0, jit, (self.h, self.w))
+        dy = (self.noise(rng, grain_m, 2) - 0.5) * 2 * amp + rng.normal(0, jit, (self.h, self.w))
         return cv2.remap(f, (self.xx + dx).astype(np.float32), (self.yy + dy).astype(np.float32),
                          cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
 
     def optics(self, layer):
         """Léger flou pour que la couche synthétique ait la netteté du capteur."""
-        return cv2.GaussianBlur(layer, (0, 0), max(0.4, 0.3 * self.ppm))
+        # flou du capteur : de l'ordre du pixel, quelle que soit la résolution
+        return cv2.GaussianBlur(layer, (0, 0), min(max(0.4, 0.3 * self.ppm), 1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +414,7 @@ def simulate_flood(sc, rng, severity=0.35):
     elev = 0.7 * elev + 0.3 * sc.segmean(elev)[sc.seg]
 
     flooded, level = quantile_mask(elev, region, severity)
-    flooded = clean_mask(flooded, sc.m(3), sc.m(20) ** 2)
+    flooded = clean_mask(flooded, sc.rad(3), sc.min_area(20))
     lo = elev[flooded].min() if flooded.any() else 0.0
     depth = np.clip((level - elev) / (level - lo + 1e-6), 0, 1) * flooded
 
@@ -443,12 +467,19 @@ def simulate_flood(sc, rng, severity=0.35):
 def simulate_fire(sc, rng, severity=0.35, active=None):
     h, w = sc.h, sc.w
     f = sc.f
-    region = ~sc.water & (sc.cls != UNKNOWN)
+    # surfaces combustibles (sur drone, la chaussée est exclue)
+    region = ~sc.water & (sc.cls != UNKNOWN) & getattr(sc, "burnable", True)
     if active is None:
-        active = rng.random() < 0.3
+        active = getattr(sc, "allow_active_fire", True) and rng.random() < 0.3
 
     # allumage dans la végétation si possible, propagation poussée par le vent
-    y0, x0 = random_point(sc.veg & region if (sc.veg & region).any() else region, rng)
+    if getattr(sc, "ignite_on_roofs", False) and (sc.roof & region).any():
+        start = sc.roof & region            # incendie urbain : départ dans une maison
+    elif (sc.veg & region).any():
+        start = sc.veg & region
+    else:
+        start = region
+    y0, x0 = random_point(start, rng)
     theta = rng.uniform(0, 2 * np.pi)
     wx, wy = np.cos(theta), np.sin(theta)
     dx, dy = sc.xx - x0, sc.yy - y0
@@ -461,7 +492,7 @@ def simulate_fire(sc, rng, severity=0.35, active=None):
     spread = 0.4 * spread + 0.6 * sc.segmean(spread)[sc.seg]
 
     burned, level = quantile_mask(spread, region, severity)
-    burned = clean_mask(burned, sc.m(1.5), sc.m(15) ** 2)
+    burned = clean_mask(burned, sc.rad(1.5), sc.min_area(15))
     lo = spread[burned].min() if burned.any() else 0.0
     inten = np.clip((level - spread) / (level - lo + 1e-6), 0, 1)[..., None]
 
@@ -494,13 +525,27 @@ def simulate_fire(sc, rng, severity=0.35, active=None):
     ash = np.where(rust, ash * np.array([1.05, 0.72, 0.52], np.float32), ash)
     debris = (sc.noise(rng, 1.5, 2) > 0.62)[..., None]
     house_col = np.where(debris, ash * 0.45, ash)
-    outline = house & ~cv2.erode(house.astype(np.uint8), disk(sc.m(0.7))).astype(bool)
+    outline = house & ~cv2.erode(house.astype(np.uint8), disk(sc.m(0.3))).astype(bool)  # épaisseur d'un mur
     house_col = np.where(outline[..., None], house_col * 0.45, house_col)
 
     layer = np.where(house[..., None], house_col, np.where(veg[..., None], veg_col, ground_col))
     layer = sc.optics(layer)
     alpha = soft(burned & ~survivor, sc.m(0.5)) * 0.97
     out = blend(f, layer, alpha)
+
+    # maisons brûlées : lit de cendres, morceaux de toiture carbonisés aux bords
+    # nets (fissures, ombres), tôles rouillées, murs noircis
+    if house.any():
+        base = rubble_base(sc, rng, f, tint=(96, 90, 84)) * 0.75
+        out = np.where(house[..., None], base, out)
+        g = luminance(f)[..., None]
+        charred = g * 0.3 + np.array([22, 20, 18], np.float32)
+        rusty = (sc.noise(rng, 2.0, 3) > 0.75)[..., None]
+        charred = np.where(rusty, charred * np.array([2.0, 1.25, 0.8], np.float32) + 20, charred)
+        p, v, c, _ = shatter(sc, rng, house, charred, cell_m=0.7, move_m=0.2, rot_deg=12,
+                             drop=0.45, tilt=0.35)
+        out = draw_pieces(sc, out, p, v & house, c & house, shadow_m=0.08)
+        out = np.where(outline[..., None], out * 0.45, out)
 
     # végétation roussie juste à l'extérieur du périmètre
     halo = cv2.dilate(burned.astype(np.uint8), disk(sc.m(6))).astype(bool) & ~burned & sc.veg
@@ -532,17 +577,207 @@ def simulate_fire(sc, rng, severity=0.35, active=None):
 
 
 # ---------------------------------------------------------------------------
+# Débris : fragmentation de Voronoï (commun séisme / tornade / incendie)
+# ---------------------------------------------------------------------------
+# Un débris se lit à des bords nets, des fissures sombres entre morceaux, des
+# ombres portées et des luminosités différentes (morceaux inclinés). On découpe
+# donc la matière d'origine (toit) en cellules de Voronoï, on déplace / tourne /
+# ré-éclaire chaque cellule, et on dessine fissures et ombres.
+SUN = (0.7, 0.7)   # direction des ombres portées (vers le bas à droite)
+
+
+def _cells(sc, rng, region, cell_m, max_cells=60000):
+    """Pavage de Voronoï dont les germes sont tirés dans `region`.
+    Renvoie (labels H x W dans [0, N), N), ou (None, 0) si la région est vide."""
+    ys, xs = np.nonzero(region)
+    if len(ys) == 0:
+        return None, 0
+    cell = max(2.0, sc.m(cell_m))
+    n = int(np.clip(len(ys) / cell ** 2, 1, max_cells))
+    pick = rng.choice(len(ys), size=n, replace=False) if n < len(ys) else np.arange(len(ys))
+    seeds = np.ones((sc.h, sc.w), np.uint8)
+    seeds[ys[pick], xs[pick]] = 0
+    _, lab = cv2.distanceTransformWithLabels(seeds, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    lab = lab.astype(np.int32) - 1
+    return lab, int(lab.max()) + 1
+
+
+def _cell_geometry(sc, lab, n):
+    cnt = np.maximum(np.bincount(lab.ravel(), minlength=n), 1)
+    cx = np.bincount(lab.ravel(), sc.xx.ravel(), n) / cnt
+    cy = np.bincount(lab.ravel(), sc.yy.ravel(), n) / cnt
+    return cx, cy
+
+
+def _boundaries(lab):
+    k = np.ones((3, 3), np.uint8)
+    lf = lab.astype(np.float32)
+    return cv2.dilate(lf, k) != cv2.erode(lf, k)
+
+
+def shatter(sc, rng, region, src, cell_m, move_m, rot_deg, drop, tilt):
+    """Brise `region` de `src` en morceaux légèrement déplacés, tournés et
+    ré-éclairés (effondrement sur place, tuiles arrachées...).
+    Renvoie (morceaux HxWx3, valide, fissures, labels)."""
+    lab, n = _cells(sc, rng, region, cell_m)
+    if lab is None:
+        z = np.zeros((sc.h, sc.w), bool)
+        return np.zeros_like(src), z, z, None
+    cx, cy = _cell_geometry(sc, lab, n)
+    dx = rng.normal(0, sc.m(move_m), n)
+    dy = rng.normal(0, sc.m(move_m), n)
+    th = np.deg2rad(rng.normal(0, rot_deg, n))
+    shade = rng.uniform(1 - tilt, 1 + 0.5 * tilt, n).astype(np.float32)
+    gone = rng.random(n) < drop
+    L = lab
+    px, py = sc.xx - cx[L] - dx[L], sc.yy - cy[L] - dy[L]
+    co, si = np.cos(th)[L], np.sin(th)[L]
+    mapx = (co * px + si * py + cx[L]).astype(np.float32)
+    mapy = (-si * px + co * py + cy[L]).astype(np.float32)
+    pieces = cv2.remap(src, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    pieces = pieces * shade[L][..., None]
+    inside = cv2.remap(region.astype(np.uint8), mapx, mapy, cv2.INTER_NEAREST,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    valid = inside & ~gone[L]
+    # fissures : contour des morceaux + une partie seulement des joints internes
+    # (tous les joints marqués donnent un aspect de dallage régulier)
+    outer = valid & ~cv2.erode(valid.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    inner = _boundaries(L) & valid & (rng.random(n) < 0.45)[L]
+    return pieces, valid, outer | inner, L
+
+
+def chips(sc, rng, landing, source, src, cell_m, prob):
+    """Éclats : morceaux prélevés dans `source` (toits) et retombés dans
+    `landing`, avec une probabilité `prob` (carte H x W) par cellule."""
+    lab, n = _cells(sc, rng, landing, cell_m)
+    ys, xs = np.nonzero(source)
+    if lab is None or len(ys) == 0:
+        z = np.zeros((sc.h, sc.w), bool)
+        return np.zeros_like(src), z, z
+    cx, cy = _cell_geometry(sc, lab, n)
+    ix = np.clip(cx.astype(int), 0, sc.w - 1)
+    iy = np.clip(cy.astype(int), 0, sc.h - 1)
+    keep = rng.random(n) < prob[iy, ix]
+    k = rng.integers(len(ys), size=n)
+    sx, sy = xs[k].astype(np.float32), ys[k].astype(np.float32)
+    th = rng.uniform(0, 2 * np.pi, n)
+    shade = rng.uniform(0.6, 1.15, n).astype(np.float32)
+    L = lab
+    px, py = sc.xx - cx[L], sc.yy - cy[L]
+    co, si = np.cos(th)[L], np.sin(th)[L]
+    mapx = (co * px + si * py + sx[L]).astype(np.float32)
+    mapy = (-si * px + co * py + sy[L]).astype(np.float32)
+    pieces = cv2.remap(src, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    pieces = pieces * shade[L][..., None]
+    inside = cv2.remap(source.astype(np.uint8), mapx, mapy, cv2.INTER_NEAREST,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    valid = keep[L] & inside & landing
+    outer = valid & ~cv2.erode(valid.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    return pieces, valid, outer
+
+
+def draw_pieces(sc, out, pieces, valid, cracks, shadow_m=0.15, crack_dark=0.55):
+    """Pose des morceaux : ombre portée, morceaux, fissures sombres.
+    Si un morceau de ~40 cm fait moins de 3 px (satellite), fissures et ombres
+    ne seraient que des points noirs : on pose seulement les morceaux."""
+    if sc.m(0.4) < 3:
+        return np.where(valid[..., None], pieces, out)
+    s = max(1.0, sc.m(shadow_m))
+    sh = shift(valid.astype(np.float32), SUN[0] * s, SUN[1] * s) > 0.5
+    out = np.where((sh & ~valid)[..., None], out * 0.55, out)
+    out = np.where(valid[..., None], pieces, out)
+    return np.where(cracks[..., None], out * crack_dark, out)
+
+
+def rubble_base(sc, rng, src, tint=(150, 142, 130)):
+    """Lit de gravats : béton / poussière à grain fin, mêlé aux couleurs locales."""
+    g = sc.noise(rng, 0.4, 3)[..., None]
+    base = np.array(tint, np.float32) * (0.7 + 0.55 * g)
+    base = 0.6 * base + 0.4 * 0.8 * sc.scramble(src, rng, 1.0, 0.5)
+    base = base * (0.8 + 0.4 * sc.noise(rng, 0.06, 2))[..., None]
+    dark = sc.noise(rng, 0.15, 2) > 0.72
+    return np.where(dark[..., None], base * 0.45, base)
+
+
+PLANK_COLORS = np.array([[168, 138, 98], [196, 170, 128], [120, 96, 70],
+                         [206, 202, 192], [80, 72, 64]], np.float32)
+
+
+def scatter_planks(sc, rng, out, where, density_m2, max_n=900):
+    """Planches, poutres, plaques éparpillées (seulement si une planche de
+    ~12 cm fait au moins 1 px : inutile en satellite)."""
+    if sc.m(0.12) < 1.0 or not where.any():
+        return out
+    ys, xs = np.nonzero(where)
+    n = int(min(max_n, len(ys) / sc.ppm ** 2 * density_m2))
+    if n <= 0:
+        return out
+    canvas = np.zeros_like(out)
+    pm = np.zeros((sc.h, sc.w), np.uint8)
+    shm = np.zeros((sc.h, sc.w), np.uint8)
+    s = max(1, int(round(sc.m(0.1))))
+    for i in rng.integers(len(ys), size=n):
+        y, x = int(ys[i]), int(xs[i])
+        ang = rng.uniform(0, np.pi)
+        L = sc.m(rng.uniform(0.8, 3.5))
+        wd = max(1, int(round(sc.m(rng.uniform(0.06, 0.2)))))
+        x2, y2 = int(x + np.cos(ang) * L), int(y + np.sin(ang) * L)
+        col = PLANK_COLORS[rng.integers(len(PLANK_COLORS))] * rng.uniform(0.8, 1.1)
+        cv2.line(shm, (x + s, y + s), (x2 + s, y2 + s), 255, wd)
+        cv2.line(canvas, (x, y), (x2, y2), tuple(float(v) for v in col), wd)
+        cv2.line(pm, (x, y), (x2, y2), 255, wd)
+    plank = pm > 0
+    out = np.where(((shm > 0) & ~plank)[..., None], out * 0.55, out)
+    grain = (0.85 + 0.3 * sc.noise(rng, 0.3, 2))[..., None]
+    return np.where(plank[..., None], canvas * grain, out)
+
+
+def rafters(sc, rng, region):
+    """Charpente apparente (toit arraché) : chevrons parallèles à l'axe court
+    de chaque bâtiment, sur fond de combles sombres et de voliges."""
+    if sc.m(0.6) < 4:   # chevrons invisibles à cette résolution
+        return np.array([100, 82, 62], np.float32) * sc.tex
+    seg, n = sc.seg, sc.nseg
+    m = region.astype(np.float64).ravel()
+    cnt = np.bincount(seg.ravel(), m, n) + 1e-6
+    x, y = sc.xx.ravel(), sc.yy.ravel()
+    mx = np.bincount(seg.ravel(), x * m, n) / cnt
+    my = np.bincount(seg.ravel(), y * m, n) / cnt
+    dxs, dys = x - mx[seg.ravel()], y - my[seg.ravel()]
+    mu20 = np.bincount(seg.ravel(), dxs * dxs * m, n) / cnt
+    mu02 = np.bincount(seg.ravel(), dys * dys * m, n) / cnt
+    mu11 = np.bincount(seg.ravel(), dxs * dys * m, n) / cnt
+    ang = (0.5 * np.arctan2(2 * mu11, mu20 - mu02))[seg]
+    t = sc.xx * np.cos(ang) + sc.yy * np.sin(ang)
+    period = sc.m(0.6)
+    rafter = np.mod(t, period) < max(1.5, sc.m(0.1))
+    attic = np.array([58, 50, 44], np.float32) * (0.7 + 0.6 * sc.noise(rng, 0.5, 3))[..., None]
+    deck = np.array([176, 146, 102], np.float32) * (0.8 + 0.3 * sc.noise(rng, 0.2, 2))[..., None]
+    under = np.where((sc.noise(rng, 1.2, 3) > 0.55)[..., None], deck, attic)
+    wood = np.array([182, 152, 112], np.float32) * (0.85 + 0.25 * sc.noise(rng, 0.3, 2))[..., None]
+    return np.where(rafter[..., None], wood, under)
+
+
+# ---------------------------------------------------------------------------
 # Désastre 3 : séisme
 # ---------------------------------------------------------------------------
 def simulate_earthquake(sc, rng, severity=0.4):
     f = sc.f
     target_s = sc.roof_s.copy()
-    if target_s.sum() < 20:  # presque pas de bâti : on prend les objets non végétaux
+    # presque pas de bâti : on prend les objets non végétaux (sur une image de
+    # drone, un objet = une maison entière, d'où un seuil réglable par scène)
+    if target_s.sum() < getattr(sc, "min_roof_objects", 20):
         target_s = ~sc.veg_s & ~sc.water_s
 
     # épicentre sur un bâtiment ; probabilité d'effondrement décroissante avec la distance
     idx = np.nonzero(target_s)[0]
-    c = idx[rng.integers(len(idx))] if len(idx) else 0
+    if len(idx) and getattr(sc, "epicenter_by_area", False):
+        # épicentre tiré proportionnellement à la surface des objets : sur une
+        # image de drone, un grand bâtiment occupe la scène, il doit pouvoir être touché
+        wgt = sc.area[idx] / sc.area[idx].sum()
+        c = idx[rng.choice(len(idx), p=wgt)]
+    else:
+        c = idx[rng.integers(len(idx))] if len(idx) else 0
     ex, ey = sc.cent_x[c], sc.cent_y[c]
     dist = np.hypot(sc.cent_x - ex, sc.cent_y - ey)
     dist = dist / (dist[target_s].max() + 1e-6) if len(idx) else dist
@@ -554,40 +789,67 @@ def simulate_earthquake(sc, rng, severity=0.4):
     order = np.argsort(score)
     collapsed_s = np.zeros(sc.nseg, bool)
     partial_s = np.zeros(sc.nseg, bool)
-    n_c = int(severity * n_t)
+    if n_t and getattr(sc, "epicenter_by_area", False):
+        # sévérité = part de la SURFACE bâtie touchée (un entrepôt de 5000 m²
+        # ne pèse pas comme un cabanon) ; au moins un bâtiment touché
+        a = sc.area[order[:n_t]]
+        cum = np.cumsum(a) / a.sum()
+        n_c = int(np.searchsorted(cum, severity) + 1)
+        n_p = int(np.searchsorted(cum, min(1.0, 1.6 * severity)) + 1) - n_c
+    else:
+        n_c = max(1, int(round(severity * n_t))) if n_t else 0
+        n_p = int(0.6 * severity * n_t)
     collapsed_s[order[:n_c]] = True
-    partial_s[order[n_c:n_c + int(0.6 * severity * n_t)]] = True
+    partial_s[order[n_c:n_c + max(0, n_p)]] = True
 
     collapsed = collapsed_s[sc.seg]
     partial = partial_s[sc.seg]
 
-    # gravats : bâtiment brouillé, désaturé, mêlé de béton et d'ombres de débris
-    spill = cv2.dilate(collapsed.astype(np.uint8), disk(sc.m(1.2))).astype(bool)
-    spill &= (sc.noise(rng, 1.5, 2) > 0.45) | collapsed
-    spill &= ~sc.water
-    scr = sc.scramble(f, rng, 2.5, 1.5)
-    gray = luminance(scr)[..., None]
-    scr = scr * 0.65 + gray * 0.35
-    concrete = np.array([172, 166, 154], np.float32)
-    chunks = sc.noise(rng, 1.5, 2)[..., None]
-    rubble = np.where(chunks > 0.62, scr * 0.5 + concrete * 0.5 * 1.1, scr)   # blocs de béton clairs
-    rubble = np.where(chunks < 0.3, rubble * 0.5, rubble)                    # vides / ombres entre débris
-    rubble = cv2.GaussianBlur(rubble, (0, 0), 0.5)
-    a_rub = np.where(collapsed, 1.0, 0.75) * spill
-    out = blend(f, rubble, soft(a_rub, 0.6))
+    out = f.copy()
+    foot = collapsed & ~sc.water
+    gray = luminance(f)[..., None]
+    dusty = (f * 0.7 + gray * 0.3) * 0.9 + np.array([18, 16, 12], np.float32)   # matière poussiéreuse
 
-    # toits endommagés : trous sombres et tuiles/tôles déplacées
-    dmg_spots = partial & (sc.noise(rng, 1.2, 2) > 0.62)
-    part = sc.scramble(f, rng, 0.8, 1.0) * 0.9
-    part = np.where((sc.noise(rng, 0.6, 1) > 0.7)[..., None], part * 0.5, part)
-    out = blend(out, part, soft(dmg_spots, 0.6) * 0.85)
+    # lit de gravats sur l'emprise, qui déborde irrégulièrement sur ~1,5 m
+    ring = cv2.dilate(foot.astype(np.uint8), disk(sc.m(1.5))).astype(bool) & ~sc.water
+    bed = foot | (ring & (sc.noise(rng, 0.5, 3) > 0.5))
+    out = np.where(bed[..., None], rubble_base(sc, rng, f), out)
 
-    # poussière légère autour des effondrements
-    dust = soft(spill, sc.m(10)) * 0.05 * sc.noise(rng, 30, 2)
+    # petits morceaux en vrac, puis grandes plaques (pans de toit, dalles)
+    # brisées, inclinées, en partie tombées, posées par-dessus
+    p0, v0, c0, _ = shatter(sc, rng, foot, dusty, cell_m=0.35, move_m=0.25, rot_deg=40,
+                            drop=0.4, tilt=0.45)
+    out = draw_pieces(sc, out, p0, v0, c0, shadow_m=0.06, crack_dark=0.7)
+    big = foot & (sc.noise(rng, 2.5, 3) > 0.4)
+    p1, v1, c1, _ = shatter(sc, rng, big, dusty, cell_m=1.3, move_m=0.4, rot_deg=15,
+                            drop=0.45, tilt=0.45)
+    out = draw_pieces(sc, out, p1, v1, c1, shadow_m=0.2)
+
+    # éclats projetés autour du bâtiment, de plus en plus rares en s'éloignant
+    land = cv2.dilate(foot.astype(np.uint8), disk(sc.m(3))).astype(bool) & ~foot & ~sc.water
+    d = cv2.distanceTransform((~foot).astype(np.uint8), cv2.DIST_L2, 5)
+    prob = 0.55 * np.exp(-d / max(1.0, sc.m(1.0)))
+    p2, v2, c2 = chips(sc, rng, land, foot, dusty, cell_m=0.22, prob=prob)
+    out = draw_pieces(sc, out, p2, v2, c2, shadow_m=0.08, crack_dark=0.75)
+
+    # poutres et planches dans les gravats
+    out = scatter_planks(sc, rng, out, bed, density_m2=0.12)
+
+    # toits endommagés : tuiles déplacées et trous laissant voir les combles
+    zone = partial & (sc.noise(rng, 1.5, 2) > 0.5)
+    p3, v3, c3, _ = shatter(sc, rng, zone, f, cell_m=0.45, move_m=0.1, rot_deg=8,
+                            drop=0.3, tilt=0.25)
+    holes = zone & ~v3
+    attic = np.array([46, 40, 36], np.float32) * (0.7 + 0.6 * sc.noise(rng, 0.3, 2))[..., None]
+    out = np.where(holes[..., None], attic, out)
+    out = draw_pieces(sc, out, p3, v3 & partial, c3 & partial, shadow_m=0.06)
+
+    # voile de poussière très léger sur et autour des effondrements
+    dust = soft(bed, sc.m(3)) * 0.12 * sc.noise(rng, 2, 2)
     out = blend(out, np.array([186, 178, 162], np.float32), dust)
 
-    alpha = np.maximum(soft(a_rub, 0.6), soft(dmg_spots, 0.6))
-    damage = spill | partial
+    alpha = (bed | v2 | zone).astype(np.float32)
+    damage = bed | v2 | partial
     return sc.finish(out, alpha, rng), damage
 
 
@@ -657,7 +919,7 @@ def simulate_tornado(sc, rng, severity=0.35, tarps=None):
 
     # --- sol : décapage (herbe arrachée -> terre brun clair)
     soil = np.array([156, 136, 104], np.float32) * tex
-    a_g = np.clip((I - 0.5) / 0.4, 0, 1) * 0.6 * sc.ground
+    a_g = np.clip((I - 0.5) / 0.4, 0, 1) * 0.6 * getattr(sc, "soil", sc.ground)
     out = blend(out, soil, a_g)
 
     # --- végétation : canopée arrachée, bois mort et terre apparente
@@ -672,21 +934,32 @@ def simulate_tornado(sc, rng, severity=0.35, tarps=None):
     major = roof & (Is > 0.42) & ~destroyed
     minor = roof & (Is > 0.18) & ~destroyed & ~major
 
-    # maison balayée : dalle de béton claire + quelques débris
-    slab = np.array([152, 144, 130], np.float32) * (0.9 + 0.2 * sc.noise(rng, 2, 2))[..., None]
-    bits = (sc.noise(rng, 0.8, 2) > 0.6)[..., None]
+    # maison balayée : dalle de béton, cloisons arrachées, quelques restes
+    slab = np.array([158, 152, 140], np.float32) * (0.85 + 0.25 * sc.noise(rng, 0.8, 3))[..., None]
+    slab = slab * (0.85 + 0.3 * sc.noise(rng, 0.06, 2))[..., None]
+    out = np.where(destroyed[..., None], slab, out)
+    wall_lines = destroyed & ~cv2.erode(destroyed.astype(np.uint8), disk(sc.m(0.25))).astype(bool)
+    out = np.where(wall_lines[..., None], out * 0.5, out)          # pied des murs arrachés
+    p1, v1, c1, _ = shatter(sc, rng, destroyed, f, cell_m=0.6, move_m=0.3, rot_deg=30,
+                            drop=0.8, tilt=0.4)
+    out = draw_pieces(sc, out, p1, v1, c1)
+    out = scatter_planks(sc, rng, out, destroyed, density_m2=0.25)
+
+    # toit arraché : charpente apparente (chevrons, voliges, combles) avec un
+    # bord déchiqueté de tuiles/bardeaux restants
+    exposed = major & (sc.noise(rng, 3, 3) > 0.35)
+    out = np.where(exposed[..., None], rafters(sc, rng, major), out)
+    rim = cv2.dilate(exposed.astype(np.uint8), disk(sc.m(0.6))).astype(bool) & major & ~exposed
+    p2, v2, c2, _ = shatter(sc, rng, rim, f, cell_m=0.3, move_m=0.08, rot_deg=10, drop=0.45, tilt=0.3)
+    out = draw_pieces(sc, out, p2, v2 & major, c2 & major, shadow_m=0.05)
+
+    # dégâts légers : bardeaux / tuiles arrachés, sous-couche sombre visible
+    spots = minor & (sc.noise(rng, 1.2, 3) > 0.6)
+    felt = np.array([70, 66, 62], np.float32) * (0.8 + 0.4 * sc.noise(rng, 0.2, 2))[..., None]
+    p3, v3, c3, _ = shatter(sc, rng, spots, f, cell_m=0.3, move_m=0.05, rot_deg=5, drop=0.55, tilt=0.2)
+    out = np.where((spots & ~v3)[..., None], felt, out)
+    out = draw_pieces(sc, out, p3, v3 & minor, c3 & minor, shadow_m=0.04)
     wood = np.array([140, 112, 82], np.float32)
-    slab = np.where(bits, sc.scramble(f, rng, 3, 1) * 0.5 + wood * 0.5, slab)
-    out = blend(out, sc.optics(slab), soft(destroyed, 0.6))
-
-    # toit arraché : charpente / plancher sombre apparent sur une partie du toit
-    exposed = major & (sc.noise(rng, 3, 2) > 0.35)
-    deck = np.array([100, 82, 62], np.float32) * tex * (0.8 + 0.4 * sc.noise(rng, 0.8, 2))[..., None]
-    out = blend(out, deck, soft(exposed, 0.6) * 0.9)
-
-    # dégâts légers : tuiles/bardeaux manquants
-    spots = minor & (sc.noise(rng, 1.2, 2) > 0.68)
-    out = blend(out, f * 0.7 + 30, soft(spots, 0.5) * 0.8)
 
     # bâches bleues sur une partie des toits endommagés
     tarp = np.zeros((h, w), bool)
@@ -697,16 +970,15 @@ def simulate_tornado(sc, rng, severity=0.35, tarps=None):
         blue = np.array([48, 98, 186], np.float32) * tex ** 0.5
         out = blend(out, blue, soft(tarp, 0.5) * 0.95)
 
-    # --- débris dispersés : morceaux des toits emportés dans le sens du vent
-    dist = sc.m(25) * sc.noise(rng, 5, 2)
-    mapx = (sc.xx - vx * dist).astype(np.float32)
-    mapy = (sc.yy - vy * dist).astype(np.float32)
-    src = cv2.remap(f, mapx, mapy, cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
-    frag = (sc.noise(rng, 0.9, 1) > (0.94 - 0.24 * I)) & (I > 0.15) & ~tarp
-    deb = 0.7 * src + 0.3 * wood * (0.7 + 0.6 * sc.noise(rng, 0.6, 1))[..., None]
-    white = (sc.noise(rng, 0.7, 1) > 0.92)[..., None]   # isolant, plaques de plâtre
-    deb = np.where(white, np.array([190, 186, 178], np.float32), deb)
-    out = blend(out, deb, soft(frag, 0.5) * 0.9)
+    # --- débris dispersés : éclats des toits touchés retombés dans le couloir,
+    # plus denses là où le vent est fort, + planches et plaques (isolant, plâtre)
+    src_roofs = roof & (Is > 0.42)
+    if not src_roofs.any():
+        src_roofs = roof & (I > 0.2)
+    land = (I > 0.15) & ~sc.water & ~roof
+    p4, frag, c4 = chips(sc, rng, land, src_roofs, f, cell_m=0.3, prob=0.04 * I)
+    out = draw_pieces(sc, out, p4, frag, c4, shadow_m=0.08, crack_dark=0.75)
+    out = scatter_planks(sc, rng, out, land & (I > 0.35), density_m2=0.04)
 
     # --- arbres cassés / déracinés, couchés dans le sens du vent (convergent)
     trunks = np.zeros((h, w), np.uint8)
@@ -715,10 +987,10 @@ def simulate_tornado(sc, rng, severity=0.35, tarps=None):
     if cand.any():
         ys, xs = np.nonzero(cand)
         p = I[ys, xs] / I[ys, xs].sum()
-        n = int(I[cand].sum() / max(1.0, sc.m(7)) ** 2)
+        n = int(I[cand].sum() / max(1.0, sc.m(12)) ** 2)
         n = min(n, 6000)
         idx = rng.choice(len(ys), size=n, p=p) if n > 0 else []
-        th_ = max(1, int(round(sc.m(0.5))))
+        th_ = max(1, int(round(sc.m(0.18))))
         sh = max(1, int(round(sc.m(0.7))))
         for i in idx:
             y, x = ys[i], xs[i]
@@ -727,8 +999,8 @@ def simulate_tornado(sc, rng, severity=0.35, tarps=None):
             x2, y2 = int(x + np.cos(ang) * L), int(y + np.sin(ang) * L)
             cv2.line(shadow, (x + sh, y + sh), (x2 + sh, y2 + sh), 255, th_, cv2.LINE_AA)
             cv2.line(trunks, (x, y), (x2, y2), 255, th_, cv2.LINE_AA)
-    out = blend(out, out * 0.45, shadow.astype(np.float32) / 255 * 0.8)
-    out = blend(out, np.array([150, 138, 116], np.float32), trunks.astype(np.float32) / 255 * 0.9)
+    out = blend(out, out * 0.6, shadow.astype(np.float32) / 255 * 0.6)
+    out = blend(out, out * 0.55 + np.array([62, 52, 38], np.float32), trunks.astype(np.float32) / 255 * 0.75)
 
     alpha = np.clip(np.maximum.reduce([a_g, a_v, soft(destroyed | exposed | spots | tarp, 0.6),
                                        frag.astype(np.float32)]), 0, 1)

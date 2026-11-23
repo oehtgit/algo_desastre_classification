@@ -1,0 +1,5 @@
+t02.jpg	CC0	ChristopherRiske	https://commons.wikimedia.org/wiki/File:Aerial_imagery_of_EF4_damage_to_homes_in_Greenfield,_Iowa.jpg
+t03.jpg	Public domain	National Weather Service at Wilmington, Ohio	https://commons.wikimedia.org/wiki/File:Aerial_imagery_of_severe_damage_done_to_downtown_Lakeview,_Ohio.jpg
+t04.jpg	Public domain	National Weather Service at Wilmington, Ohio	https://commons.wikimedia.org/wiki/File:Aerial_imagery_of_severe_tornado_damage_on_Orchard_Island.jpg
+t05.jpg	Public domain	NOAA image	https://commons.wikimedia.org/wiki/File:Aerial_photo_by_NOAA_uncrewed_aircraft_of_tornado_damage_Alabama_Mississippi_March_2021.png
+t15.jpg	Public domain	MAJ Geoff Legler	https://commons.wikimedia.org/wiki/File:An_aerial_view_shows_tornado_damage_in_Moore,_Okla.,_May_21,_2013_130521-Z-BB392-052.jpg
